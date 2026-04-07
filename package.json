@@ -1,0 +1,16 @@
+{
+  "name": "forgefreeai",
+  "version": "1.0.0",
+  "private": true,
+  "description": "ForgefreeAI Minecraft Java coding chat app powered by Codestral",
+  "main": "backend.js",
+  "scripts": {
+    "start": "node backend.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

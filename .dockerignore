@@ -1,0 +1,10 @@
+.git
+.gitignore
+.vercel
+.env
+.runtime
+node_modules
+npm-debug.log
+netlify
+*.zip
+*.jar

@@ -1,0 +1,38 @@
+[build]
+  publish = "public"
+  functions = "netlify/functions"
+
+[[redirects]]
+  from = "/api/health"
+  to = "/.netlify/functions/health"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/api/chat"
+  to = "/.netlify/functions/chat"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/api/build/run"
+  to = "/.netlify/functions/build-run"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/api/export/source"
+  to = "/.netlify/functions/export-source"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/api/export/jar"
+  to = "/.netlify/functions/export-jar"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
