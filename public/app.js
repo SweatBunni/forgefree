@@ -328,10 +328,11 @@ async function sendPrompt() {
       }),
     });
 
-    const data = await readJsonResponse(response);
     if (!response.ok) {
-      throw new Error(data.error || "Codestral request failed.");
+      throw new Error(await readResponseError(response));
     }
+
+    const data = await readJsonResponse(response);
 
     placeholder.content = data.content || "No response content returned.";
     activeChat.updatedAt = Date.now();
@@ -493,10 +494,11 @@ async function buildAndPublishArtifacts(kindToDownload) {
       }),
     });
 
-    const data = await readJsonResponse(response);
     if (!response.ok) {
-      throw new Error(data.error || "Build failed.");
+      throw new Error(await readResponseError(response));
     }
+
+    const data = await readJsonResponse(response);
 
     activeChat.latestBuild = data;
     placeholder.content = data.summary || "Build completed successfully.";
@@ -598,10 +600,27 @@ async function readResponseError(response) {
   const contentType = response.headers.get("content-type") || "";
   if (contentType.includes("application/json")) {
     const data = await readJsonResponse(response);
-    return data.error || "Request failed.";
+    return formatErrorPayload(data, "Request failed.");
   }
 
   return (await response.text()) || "Request failed.";
+}
+
+function formatErrorPayload(data, fallbackMessage) {
+  if (!data || typeof data !== "object") {
+    return fallbackMessage;
+  }
+
+  const errorText =
+    typeof data.error === "string" && data.error.trim() ? data.error.trim() : "";
+  const detailsText =
+    typeof data.details === "string" && data.details.trim() ? data.details.trim() : "";
+
+  if (errorText && detailsText && detailsText !== errorText) {
+    return `${errorText}\n\n${detailsText}`;
+  }
+
+  return errorText || detailsText || fallbackMessage;
 }
 
 async function readJsonResponse(response) {

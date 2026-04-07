@@ -276,8 +276,10 @@ async function processApiRequest({ method, pathname, bodyText }) {
       ? null
       : createJsonResponse(405, { error: "Method not allowed." });
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
     return createJsonResponse(500, {
-      error: error instanceof Error ? error.message : String(error),
+      error: message || "Request failed.",
+      details: message || "",
     });
   }
 }
