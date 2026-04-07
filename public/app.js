@@ -593,6 +593,9 @@ function formatHostingLabel(hostingTarget) {
   if (hostingTarget === "netlify") {
     return "Netlify";
   }
+  if (hostingTarget === "render") {
+    return "Render";
+  }
   return "Hosted";
 }
 
@@ -600,10 +603,18 @@ async function readResponseError(response) {
   const contentType = response.headers.get("content-type") || "";
   if (contentType.includes("application/json")) {
     const data = await readJsonResponse(response);
-    return formatErrorPayload(data, "Request failed.");
+    return formatErrorPayload(
+      data,
+      `Request failed with HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}.`
+    );
   }
 
-  return (await response.text()) || "Request failed.";
+  const text = (await response.text()).trim();
+  if (text) {
+    return text;
+  }
+
+  return `Request failed with HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}.`;
 }
 
 function formatErrorPayload(data, fallbackMessage) {
