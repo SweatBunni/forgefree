@@ -1,11 +1,11 @@
-FROM node:20-bookworm-slim
+FROM node:20-bookworm-slim AS node-runtime
+
+FROM eclipse-temurin:21-jdk-jammy
 
 ENV NODE_ENV=production
 WORKDIR /app
 
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends openjdk-21-jdk ca-certificates \
-  && rm -rf /var/lib/apt/lists/*
+COPY --from=node-runtime /usr/local /usr/local
 
 COPY package*.json ./
 RUN npm ci --omit=dev

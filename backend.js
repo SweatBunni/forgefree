@@ -2399,6 +2399,9 @@ function readZipEntryData(buffer, entry) {
 function selectWritableRuntimeRoot() {
   const candidates = [
     process.env.FORGEFREEAI_RUNTIME_ROOT,
+    process.env.RENDER_DISK_MOUNT_PATH
+      ? path.join(process.env.RENDER_DISK_MOUNT_PATH, "ForgefreeAI")
+      : "",
     process.env.RAILWAY_VOLUME_MOUNT_PATH
       ? path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH, "ForgefreeAI")
       : "",
