@@ -26,7 +26,7 @@ const HOSTING_TARGET = process.env.NETLIFY
     : process.env.RENDER || process.env.RENDER_SERVICE_ID
       ? "render"
     : "local";
-const IS_SERVERLESS = HOSTING_TARGET !== "local";
+const IS_SERVERLESS = HOSTING_TARGET === "vercel" || HOSTING_TARGET === "netlify";
 const GRADLE_VERSION = "9.2.0";
 const GRADLE_ZIP_NAME = `gradle-${GRADLE_VERSION}-bin.zip`;
 const GRADLE_DIR_NAME = `gradle-${GRADLE_VERSION}`;
