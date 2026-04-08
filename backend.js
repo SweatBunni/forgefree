@@ -43,7 +43,7 @@ const activeBuildJobs = new Map();
 const MAX_BUILD_REPAIR_ATTEMPTS = Number(process.env.MAX_BUILD_REPAIR_ATTEMPTS || "0");
 const MAX_STALLED_BUILD_ATTEMPTS = Number(process.env.MAX_STALLED_BUILD_ATTEMPTS || "6");
 const BUILD_JOB_POLL_MAX_AGE_MS = Number(process.env.BUILD_JOB_POLL_MAX_AGE_MS || 6 * 60 * 60 * 1000);
-const MAX_RESEARCH_SOURCES = 3;
+const MAX_RESEARCH_SOURCES = 5;
 const MAX_RESEARCH_CHARS_PER_SOURCE = 2200;
 const DEFAULT_MAX_COMPLETION_TOKENS = Number(process.env.MISTRAL_MAX_TOKENS || "12000");
 const MAX_CONTINUATION_PASSES = Number(process.env.MISTRAL_MAX_CONTINUATIONS || "3");
@@ -63,16 +63,12 @@ let nextMistralRequestAt = 0;
 const RESEARCH_SOURCE_MAP = {
   "fabric-mod": [
     {
+      label: "Fabric Project Structure",
+      url: "https://docs.fabricmc.net/develop/getting-started/project-structure",
+    },
+    {
       label: "Fabric Blocks",
       url: "https://docs.fabricmc.net/develop/blocks/first-block",
-    },
-    {
-      label: "Fabric Items",
-      url: "https://docs.fabricmc.net/develop/items/first-item",
-    },
-    {
-      label: "Fabric Tinting",
-      url: "https://docs.fabricmc.net/develop/blocks/transparency-and-tinting",
     },
   ],
   "paper-plugin": [
@@ -177,7 +173,7 @@ Rules:
 - The line END_FILE must appear alone on its own line only as the file terminator. If needed, rewrite content slightly to avoid a literal standalone END_FILE line.
 - Always include at least one FILE block.
 - For Fabric projects, include a settings.gradle with pluginManagement repositories for Fabric (https://maven.fabricmc.net/), Maven Central, and the Gradle Plugin Portal.
-- For Fabric projects, prefer id 'net.fabricmc.fabric-loom-remap' version "\${loom_version}" and define loom_version in gradle.properties.`;
+- For Fabric projects targeting Minecraft 1.21.11 or older, use the legacy-compatible Loom plugin alias id 'fabric-loom' version "\${loom_version}" so Gradle plugin resolution remains compatible, include a settings.gradle with Fabric plugin repositories, and define minecraft_version, loader_version, loom_version, archives_base_name, maven_group, mod_version, and fabric_version in gradle.properties.`;
 const BUILD_REPAIR_SYSTEM_PROMPT = `You repair Minecraft Java projects after failed Gradle builds.
 
 Return plain text only in this exact tagged format. Do not use JSON. Do not use markdown fences. Do not add commentary before or after the format.
@@ -1177,13 +1173,24 @@ function normalizeCompletenessText(value) {
 
 async function generateProjectBundle(messages, temperature, preferences) {
   const inferredTargetType = inferTargetType(messages, preferences);
+  const researchGuidance = buildLoaderVersionResearchGuidance({
+    targetType: inferredTargetType,
+    minecraftVersion: preferences?.minecraftVersion || "",
+  });
   const researchContext = await gatherResearchContext({
     messages,
     targetType: inferredTargetType,
+    minecraftVersion: preferences?.minecraftVersion || "",
   });
   const generationMessages = [
     { role: "system", content: PROJECT_GENERATION_SYSTEM_PROMPT },
     ...createPreferenceMessages(preferences),
+    {
+      role: "system",
+      content:
+        "Before generating code, align plugin IDs, mappings namespace, imports, loader/API versions, and Gradle coordinates with the supplied research context and the requested Minecraft version. Do not invent version numbers or mix Mojang-named imports with a non-matching mappings setup.",
+    },
+    { role: "system", content: researchGuidance },
     ...(researchContext
       ? [
           {
@@ -1495,21 +1502,88 @@ function ensureFabricSettingsGradle(existing) {
   return `${pluginManagementBlock}\n${safeLines.join("\n")}\n`;
 }
 
-function ensureFabricGradleProperties(existing, project) {
+function setOrReplaceGradleProperty(lines, key, value) {
+  const entry = `${key}=${value}`;
+  const existingIndex = lines.findIndex((line) => line.trim().startsWith(`${key}=`));
+
+  if (existingIndex >= 0) {
+    lines[existingIndex] = entry;
+    return;
+  }
+
+  lines.push(entry);
+}
+
+function extractGradleProperty(text, key) {
+  const pattern = new RegExp(`^\\s*${key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*=\\s*(.+?)\\s*$`, "m");
+  return captureMatch(text, pattern);
+}
+
+function ensureFabricGradleProperties(existing, project, options = {}) {
   const lines = existing ? existing.replace(/\r\n/g, "\n").split("\n") : [];
   const fabricDefaults = resolveFabricDefaults(project.minecraftVersion);
+  const forceDefaultKeys = new Set(
+    Array.isArray(options.forceDefaultKeys) ? options.forceDefaultKeys : []
+  );
+  const fabricModJsonFile = project.files.find(
+    (file) => file.path === "src/main/resources/fabric.mod.json"
+  );
+  let fabricModJson = null;
+
+  if (fabricModJsonFile) {
+    try {
+      fabricModJson = JSON.parse(fabricModJsonFile.content);
+    } catch (_error) {
+      fabricModJson = null;
+    }
+  }
+
   const requiredDefaults = {
     "org.gradle.jvmargs": "-Xmx1G",
     "org.gradle.parallel": "true",
     "org.gradle.configuration-cache": "false",
-    "loom_version": "1.14-SNAPSHOT",
-    "fabric_version": fabricDefaults.fabricApiVersion,
+    "minecraft_version":
+      project.minecraftVersion ||
+      extractGradleProperty(existing, "minecraft_version") ||
+      fabricDefaults.minecraftVersion,
+    "loader_version":
+      extractGradleProperty(existing, "loader_version") ||
+      normalizeFabricLoaderVersion(fabricModJson?.depends?.fabricloader) ||
+      fabricDefaults.loaderVersion,
+    "loom_version": fabricDefaults.loomVersion,
+    "mod_version":
+      extractGradleProperty(existing, "mod_version") ||
+      normalizeFabricVersion(fabricModJson?.version) ||
+      "1.0.0",
+    "maven_group":
+      extractGradleProperty(existing, "maven_group") ||
+      guessJavaPackageGroup(project) ||
+      "com.example",
+    "archives_base_name":
+      extractGradleProperty(existing, "archives_base_name") ||
+      (fabricModJson && typeof fabricModJson.id === "string" && fabricModJson.id.trim()) ||
+      project.projectSlug ||
+      "forgefreeai-mod",
+    "fabric_version":
+      forceDefaultKeys.has("fabric_version")
+        ? fabricDefaults.fabricApiVersion
+        : extractGradleProperty(existing, "fabric_version") || fabricDefaults.fabricApiVersion,
   };
 
+  if (forceDefaultKeys.has("minecraft_version")) {
+    requiredDefaults.minecraft_version = fabricDefaults.minecraftVersion;
+  }
+
+  if (forceDefaultKeys.has("loader_version")) {
+    requiredDefaults.loader_version = fabricDefaults.loaderVersion;
+  }
+
+  if (forceDefaultKeys.has("loom_version")) {
+    requiredDefaults.loom_version = fabricDefaults.loomVersion;
+  }
+
   for (const [key, value] of Object.entries(requiredDefaults)) {
-    if (!lines.some((line) => line.trim().startsWith(`${key}=`))) {
-      lines.push(`${key}=${value}`);
-    }
+    setOrReplaceGradleProperty(lines, key, value);
   }
 
   return lines.join("\n").trim() + "\n";
@@ -1520,15 +1594,15 @@ function ensureFabricBuildGradle(existing, project) {
   const metadata = extractFabricBuildMetadata(existing, project, fabricDefaults);
 
   return `plugins {
-    id 'net.fabricmc.fabric-loom-remap' version "\${loom_version}"
+    id 'fabric-loom' version "\${loom_version}"
     id 'maven-publish'
 }
 
-version = '${metadata.modVersion}'
-group = '${metadata.mavenGroup}'
+version = project.mod_version
+group = project.maven_group
 
 base {
-    archivesName = '${metadata.archivesBaseName}'
+    archivesName = project.archives_base_name
 }
 
 repositories {
@@ -1537,10 +1611,10 @@ repositories {
 }
 
 dependencies {
-    minecraft "com.mojang:minecraft:${metadata.minecraftVersion}"
-    mappings "net.fabricmc:yarn:${metadata.yarnMappings}:v2"
-    modImplementation "net.fabricmc:fabric-loader:${metadata.loaderVersion}"
-    modImplementation "net.fabricmc.fabric-api:fabric-api:${metadata.fabricApiVersion}"
+    minecraft "com.mojang:minecraft:\${project.minecraft_version}"
+    mappings loom.officialMojangMappings()
+    modImplementation "net.fabricmc:fabric-loader:\${project.loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:\${project.fabric_version}"
 }
 
 processResources {
@@ -1590,10 +1664,12 @@ function extractFabricBuildMetadata(existing, project, fabricDefaults) {
   return {
     modVersion:
       captureMatch(buildGradle, /^\s*version\s*=\s*['"]([^'"]+)['"]/m) ||
+      captureMatch(buildGradle, /^\s*version\s*=\s*project\.mod_version\b/m) ||
       normalizeFabricVersion(fabricModJson?.version) ||
       "1.0.0",
     mavenGroup:
       captureMatch(buildGradle, /^\s*group\s*=\s*['"]([^'"]+)['"]/m) ||
+      captureMatch(buildGradle, /^\s*group\s*=\s*project\.maven_group\b/m) ||
       guessJavaPackageGroup(project) ||
       "com.example",
     archivesBaseName:
@@ -1602,16 +1678,16 @@ function extractFabricBuildMetadata(existing, project, fabricDefaults) {
       "forgefreeai-mod",
     minecraftVersion:
       project.minecraftVersion ||
+      captureMatch(buildGradle, /minecraft\s+["']com\.mojang:minecraft:\$\{project\.minecraft_version\}["']/m) ||
       captureMatch(buildGradle, /minecraft\s+['"]com\.mojang:minecraft:([^'"]+)['"]/m) ||
       "1.21.1",
-    yarnMappings:
-      captureMatch(buildGradle, /mappings\s+['"]net\.fabricmc:yarn:([^'"]+):v2['"]/m) ||
-      fabricDefaults.yarnMappings,
     loaderVersion:
       captureMatch(buildGradle, /fabric-loader:([^'"]+)['"]/m) ||
       normalizeFabricLoaderVersion(fabricModJson?.depends?.fabricloader) ||
       fabricDefaults.loaderVersion,
-    fabricApiVersion: fabricDefaults.fabricApiVersion,
+    fabricApiVersion:
+      captureMatch(buildGradle, /fabric-api:fabric-api:([^'"]+)['"]/m) ||
+      fabricDefaults.fabricApiVersion,
     javaVersion:
       typeof project.javaVersion === "number" && Number.isFinite(project.javaVersion)
         ? project.javaVersion
@@ -1624,32 +1700,36 @@ function resolveFabricDefaults(minecraftVersion) {
 
   if (version === "1.21.1") {
     return {
+      minecraftVersion: "1.21.1",
+      loomVersion: "1.14-SNAPSHOT",
       fabricApiVersion: "0.116.9+1.21.1",
-      yarnMappings: "1.21.1+build.1",
-      loaderVersion: "0.15.11",
+      loaderVersion: "0.16.10",
     };
   }
 
   if (version === "1.21.11") {
     return {
-      fabricApiVersion: "0.139.4+1.21.11",
-      yarnMappings: "1.21.11+build.1",
+      minecraftVersion: "1.21.11",
+      loomVersion: "1.14-SNAPSHOT",
+      fabricApiVersion: "0.141.3+1.21.11",
       loaderVersion: "0.18.2",
     };
   }
 
   if (version.startsWith("1.21")) {
     return {
+      minecraftVersion: "1.21.1",
+      loomVersion: "1.14-SNAPSHOT",
       fabricApiVersion: "0.116.9+1.21.1",
-      yarnMappings: "1.21.1+build.1",
-      loaderVersion: "0.15.11",
+      loaderVersion: "0.16.10",
     };
   }
 
   return {
+    minecraftVersion: version || "1.21.1",
+    loomVersion: "1.14-SNAPSHOT",
     fabricApiVersion: "0.116.9+1.21.1",
-    yarnMappings: "1.21.1+build.1",
-    loaderVersion: "0.15.11",
+    loaderVersion: "0.16.10",
   };
 }
 
@@ -1749,6 +1829,16 @@ async function buildProjectSession(messages, temperature, preferences, onProgres
       return manifest;
     } catch (error) {
       const buildLog = extractBuildErrorLog(error);
+      const requiredGradleVersion = extractRequiredGradleVersion(buildLog);
+      if (
+        requiredGradleVersion &&
+        compareVersionStrings(GRADLE_VERSION, requiredGradleVersion) < 0
+      ) {
+        throw new Error(
+          `ForgefreeAI's Gradle runtime is too old for this project. The server is using Gradle ${GRADLE_VERSION}, but the build requires at least Gradle ${requiredGradleVersion}.\n\nRedeploy or restart the service after updating the backend runtime.\n\n${truncateOutput(buildLog, 3500)}`
+        );
+      }
+
       const failureSignature = createFailureSignature(buildLog);
       stalledFailureCount =
         failureSignature === lastFailureSignature ? stalledFailureCount + 1 : 1;
@@ -1771,18 +1861,52 @@ async function buildProjectSession(messages, temperature, preferences, onProgres
         );
       }
 
+      const deterministicRepair = inferHeuristicRepairFromBuildLog(project, buildLog, attempt);
+      if (deterministicRepair) {
+        const beforeState = createProjectStateSignature(project);
+        if (deterministicRepair.summary) {
+          repairSummaries.push(`Attempt ${attempt}: ${deterministicRepair.summary}`);
+        }
+
+        applyProjectRepair(project, deterministicRepair);
+        applyGeneratedProjectFixups(project);
+        const changed = beforeState !== createProjectStateSignature(project);
+
+        if (!changed) {
+          throw new Error(
+            `ForgefreeAI recognized this as a deterministic Fabric toolchain/dependency error, but the fallback rewrite did not change any files on attempt ${attempt}.\n\n${truncateOutput(buildLog, 3500)}`
+          );
+        }
+
+        attempt += 1;
+        continue;
+      }
+
       await notifyBuildProgress(onProgress, {
         stage: "repairing",
         attempt,
         message: `Build attempt ${attempt} failed. Researching the error and applying fixes...`,
       });
       const repair = await repairProjectFromBuildError(project, buildLog, attempt);
+      const beforeState = createProjectStateSignature(project);
       if (repair.summary) {
         repairSummaries.push(`Attempt ${attempt}: ${repair.summary}`);
       }
 
-      const changed = applyProjectRepair(project, repair);
+      applyProjectRepair(project, repair);
+      let changed = false;
+      if (!changed) {
+        const heuristicRepair = inferHeuristicRepairFromBuildLog(project, buildLog, attempt);
+        if (heuristicRepair) {
+          if (heuristicRepair.summary) {
+            repairSummaries.push(`Attempt ${attempt}: ${heuristicRepair.summary}`);
+          }
+          applyProjectRepair(project, heuristicRepair);
+        }
+      }
+
       applyGeneratedProjectFixups(project);
+      changed = beforeState !== createProjectStateSignature(project);
 
       if (!changed) {
         throw new Error(
@@ -1886,48 +2010,127 @@ function createFailureSignature(buildLog) {
     .slice(0, 1200);
 }
 
+function compareVersionStrings(left, right) {
+  const leftParts = String(left || "")
+    .split(".")
+    .map((part) => Number.parseInt(part, 10) || 0);
+  const rightParts = String(right || "")
+    .split(".")
+    .map((part) => Number.parseInt(part, 10) || 0);
+  const length = Math.max(leftParts.length, rightParts.length);
+
+  for (let index = 0; index < length; index += 1) {
+    const leftValue = leftParts[index] || 0;
+    const rightValue = rightParts[index] || 0;
+    if (leftValue !== rightValue) {
+      return leftValue > rightValue ? 1 : -1;
+    }
+  }
+
+  return 0;
+}
+
+function extractRequiredGradleVersion(buildLog) {
+  const match = String(buildLog || "").match(/requires at least Gradle\s+([0-9]+(?:\.[0-9]+)+)/i);
+  if (match?.[1]) {
+    return match[1];
+  }
+
+  const apiVersionMatches = [...String(buildLog || "").matchAll(/org\.gradle\.plugin\.api-version' with value '([0-9]+(?:\.[0-9]+)+)'/gi)]
+    .map((entry) => entry[1])
+    .filter(Boolean);
+
+  if (apiVersionMatches.length === 0) {
+    return "";
+  }
+
+  return apiVersionMatches.sort(compareVersionStrings).at(-1) || "";
+}
+
 async function repairProjectFromBuildError(project, buildLog, attempt) {
   const researchContext = await gatherResearchContext({
     project,
     buildLog,
     messages: [],
   });
-  const response = await requestMistral({
-    messages: [
-      { role: "system", content: BUILD_REPAIR_SYSTEM_PROMPT },
-      ...(researchContext
-        ? [
-            {
-              role: "system",
-              content: `Official docs research context:\n\n${researchContext}`,
-            },
-          ]
-        : []),
-      {
-        role: "user",
-        content: [
-          `Attempt: ${attempt}`,
-          `Project name: ${project.projectName}`,
-          `Project type: ${project.targetType}`,
-          `Minecraft version: ${project.minecraftVersion}`,
-          `Java version: ${project.javaVersion}`,
-          "",
-          "Current project files:",
-          serializeProjectFiles(project.files),
-          "",
-          "Gradle build log:",
-          truncateOutput(buildLog, 12000),
-          "",
-          "Fix the exact compile or Gradle error for the current Minecraft version and APIs. Replace removed or outdated APIs with valid ones for this version.",
-          "",
-          "Return only the changed files using the tagged repair format.",
-        ].join("\n"),
-      },
-    ],
-    temperature: 0.1,
+  const researchGuidance = buildLoaderVersionResearchGuidance({
+    targetType: project.targetType,
+    minecraftVersion: project.minecraftVersion,
   });
+  const baseMessages = [
+    { role: "system", content: BUILD_REPAIR_SYSTEM_PROMPT },
+    {
+      role: "system",
+      content:
+        "Use the research context to keep mappings namespace, imports, plugin IDs, loader/API versions, and dependency coordinates consistent with the target Minecraft version. When fixing code, prefer version-correct imports over approximate class names.",
+    },
+    { role: "system", content: researchGuidance },
+    ...(researchContext
+      ? [
+          {
+            role: "system",
+            content: `Official docs research context:\n\n${researchContext}`,
+          },
+        ]
+      : []),
+    {
+      role: "user",
+      content: [
+        `Attempt: ${attempt}`,
+        `Project name: ${project.projectName}`,
+        `Project type: ${project.targetType}`,
+        `Minecraft version: ${project.minecraftVersion}`,
+        `Java version: ${project.javaVersion}`,
+        "",
+        "Current project files:",
+        serializeProjectFiles(project.files),
+        "",
+        "Gradle build log:",
+        truncateOutput(buildLog, 12000),
+        "",
+        "Fix the exact compile or Gradle error for the current Minecraft version and APIs. Replace removed or outdated APIs with valid ones for this version.",
+        "",
+        "Return only the changed files using the tagged repair format.",
+      ].join("\n"),
+    },
+  ];
 
-  return parseRepairResponse(extractAssistantContent(response));
+  try {
+    const response = await requestMistral({
+      messages: baseMessages,
+      temperature: 0.1,
+    });
+
+    return parseRepairResponse(extractAssistantContent(response));
+  } catch (initialError) {
+    try {
+      const retryResponse = await requestMistral({
+        messages: [
+          { role: "system", content: BUILD_REPAIR_SYSTEM_PROMPT },
+          {
+            role: "system",
+            content:
+              "Your previous repair response did not produce usable file edits. Return at least one FILE or DELETE_FILE change. If the failing source file depends on removed Minecraft APIs and a safe rewrite is unclear, delete the broken file and update related config files so the project builds cleanly.",
+          },
+          ...baseMessages.filter((message) => message.role !== "system"),
+        ],
+        temperature: 0.05,
+      });
+
+      return parseRepairResponse(extractAssistantContent(retryResponse));
+    } catch (retryError) {
+      const heuristicRepair = inferHeuristicRepairFromBuildLog(project, buildLog, attempt);
+      if (heuristicRepair) {
+        return heuristicRepair;
+      }
+
+      throw new Error(
+        `The repair step did not return usable file changes. Initial error: ${
+          initialError instanceof Error ? initialError.message : String(initialError)
+        }. Retry error: ${retryError instanceof Error ? retryError.message : String(retryError)}`
+      );
+    }
+  }
 }
 
 function serializeProjectFiles(files) {
@@ -1996,18 +2199,201 @@ function parseRepairResponse(text) {
   };
 }
 
-async function gatherResearchContext({ messages, project, buildLog }) {
-  const targetType = project?.targetType || inferTargetType(messages);
-  const sources = RESEARCH_SOURCE_MAP[targetType] || [];
+function inferHeuristicRepairFromBuildLog(project, buildLog, attempt) {
+  if (
+    project.targetType === "fabric-mod" &&
+    (
+      (/fabric-loom-remap/i.test(buildLog) &&
+        /Plugin \[id:\s*'net\.fabricmc\.fabric-loom-remap'/i.test(buildLog)) ||
+      (/fabric-loom/i.test(buildLog) &&
+        /Plugin \[id:\s*'fabric-loom'/i.test(buildLog)) ||
+      /Could not find net\.fabricmc\.fabric-api:fabric-api:/i.test(buildLog) ||
+      /Unsupported unpick version/i.test(buildLog) ||
+      /Failed to setup Minecraft/i.test(buildLog) ||
+      /must be have an intermediary source namespace/i.test(buildLog)
+    )
+  ) {
+    const forceDefaultKeys = [];
+
+    if (/Could not find net\.fabricmc\.fabric-api:fabric-api:/i.test(buildLog)) {
+      forceDefaultKeys.push("fabric_version");
+    }
+
+    if (
+      /Unsupported unpick version/i.test(buildLog) ||
+      /Failed to setup Minecraft/i.test(buildLog) ||
+      /must be have an intermediary source namespace/i.test(buildLog)
+    ) {
+      forceDefaultKeys.push("loom_version", "loader_version", "minecraft_version", "fabric_version");
+    }
+
+    return createFabricToolchainRepair(project, attempt, { forceDefaultKeys });
+  }
+
+  const failingFiles = collectFailingSourceFilesFromBuildLog(buildLog);
+  if (failingFiles.length === 0) {
+    return null;
+  }
+
+  for (const candidate of failingFiles) {
+    const file = project.files.find((entry) => entry.path === candidate.path);
+    if (!file) {
+      continue;
+    }
+
+    const looksLikeBrokenMixin =
+      /\/mixin\//i.test(candidate.path) &&
+      (candidate.errorCount >= 3 || /package .* does not exist|cannot find symbol/i.test(buildLog));
+
+    if (!looksLikeBrokenMixin) {
+      continue;
+    }
+
+    const updatedFiles = removeMixinReferencesForDeletedFile(project, candidate.path);
+    return {
+      summary: `Attempt ${attempt}: Removed broken mixin source ${candidate.path} after repeated compile failures against unavailable Minecraft APIs.`,
+      files: updatedFiles,
+      deletes: [candidate.path],
+    };
+  }
+
+  return null;
+}
+
+function createFabricToolchainRepair(project, attempt, options = {}) {
+  const buildGradlePath = "build.gradle";
+  const settingsGradlePath = "settings.gradle";
+  const gradlePropertiesPath = "gradle.properties";
+  const existingBuildGradle = project.files.find((file) => file.path === buildGradlePath)?.content || "";
+  const existingSettingsGradle =
+    project.files.find((file) => file.path === settingsGradlePath)?.content || "";
+  const existingGradleProperties =
+    project.files.find((file) => file.path === gradlePropertiesPath)?.content || "";
+
+  return {
+    summary: `Attempt ${attempt}: Rewrote the Fabric Loom toolchain files to reset stale plugin and dependency settings and switch to the legacy-compatible fabric-loom plugin alias for Gradle resolution.`,
+    files: [
+      {
+        path: settingsGradlePath,
+        content: ensureFabricSettingsGradle(existingSettingsGradle),
+      },
+      {
+        path: gradlePropertiesPath,
+        content: ensureFabricGradleProperties(existingGradleProperties, project, options),
+      },
+      {
+        path: buildGradlePath,
+        content: ensureFabricBuildGradle(existingBuildGradle, project),
+      },
+    ],
+    deletes: [],
+  };
+}
+
+function collectFailingSourceFilesFromBuildLog(buildLog) {
+  const normalizedLog = String(buildLog || "").replace(/\r\n/g, "\n");
+  const fileMap = new Map();
+  const pattern = /([A-Za-z]:\\[^\n]+?\.java):\d+:\s*error:/g;
+  let match;
+
+  while ((match = pattern.exec(normalizedLog)) !== null) {
+    const relativePath = toProjectRelativeSourcePath(match[1]);
+    if (!relativePath) {
+      continue;
+    }
+
+    const current = fileMap.get(relativePath) || { path: relativePath, errorCount: 0 };
+    current.errorCount += 1;
+    fileMap.set(relativePath, current);
+  }
+
+  return Array.from(fileMap.values()).sort((left, right) => right.errorCount - left.errorCount);
+}
+
+function toProjectRelativeSourcePath(absoluteJavaPath) {
+  const normalized = String(absoluteJavaPath || "").replace(/\\/g, "/");
+  const marker = "/src/";
+  const markerIndex = normalized.toLowerCase().indexOf(marker);
+  if (markerIndex === -1) {
+    return "";
+  }
+
+  return normalized.slice(markerIndex + 1);
+}
+
+function removeMixinReferencesForDeletedFile(project, deletedPath) {
+  const updates = [];
+  const deletedFile = project.files.find((entry) => entry.path === deletedPath);
+  const className = path.basename(deletedPath, ".java");
+  const packageMatch = deletedFile?.content.match(/^\s*package\s+([a-zA-Z0-9_.]+)\s*;/m);
+  const qualifiedName = packageMatch ? `${packageMatch[1]}.${className}` : className;
+
+  for (const file of project.files) {
+    if (!/\.mixins\.json$/i.test(file.path)) {
+      continue;
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(file.content);
+    } catch (_error) {
+      continue;
+    }
+
+    let changed = false;
+    for (const key of ["mixins", "client", "server"]) {
+      if (!Array.isArray(parsed[key])) {
+        continue;
+      }
+
+      const filtered = parsed[key].filter((entry) => {
+        const value = String(entry || "");
+        return !(
+          value === className ||
+          value === qualifiedName ||
+          value.endsWith(`.${className}`)
+        );
+      });
+
+      if (filtered.length !== parsed[key].length) {
+        parsed[key] = filtered;
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      updates.push({
+        path: file.path,
+        content: `${JSON.stringify(parsed, null, 2)}\n`,
+      });
+    }
+  }
+
+  return updates;
+}
+
+async function gatherResearchContext({ messages, project, buildLog, targetType, minecraftVersion }) {
+  const resolvedTargetType = targetType || project?.targetType || inferTargetType(messages);
+  const resolvedMinecraftVersion = minecraftVersion || project?.minecraftVersion || "";
+  const sources = buildResearchSources({
+    targetType: resolvedTargetType,
+    minecraftVersion: resolvedMinecraftVersion,
+  });
   if (sources.length === 0) {
     return "";
   }
 
   const selectedSources = sources.slice(0, MAX_RESEARCH_SOURCES);
   const notes = [];
+  const researchTerms = extractResearchTerms(
+    messages,
+    buildLog,
+    resolvedTargetType,
+    resolvedMinecraftVersion
+  );
 
   for (const source of selectedSources) {
-    const note = await fetchResearchSource(source, buildLog);
+    const note = await fetchResearchSource(source, researchTerms);
     if (note) {
       notes.push(note);
     }
@@ -2052,7 +2438,113 @@ function mapLoaderToTargetType(loader) {
   return mapping[loader] || "";
 }
 
-async function fetchResearchSource(source, buildLog) {
+function resolveFabricExampleBranch(minecraftVersion) {
+  const version = String(minecraftVersion || "").trim();
+  if (version.startsWith("1.21")) {
+    return "1.21";
+  }
+  if (version.startsWith("1.20")) {
+    return "1.20";
+  }
+  return "1.21";
+}
+
+function buildResearchSources({ targetType, minecraftVersion }) {
+  const staticSources = RESEARCH_SOURCE_MAP[targetType] || [];
+  const dynamicSources = [];
+
+  if (targetType === "fabric-mod") {
+    const branch = resolveFabricExampleBranch(minecraftVersion);
+    dynamicSources.push(
+      {
+        label: "Fabric Example build.gradle",
+        url: `https://raw.githubusercontent.com/FabricMC/fabric-example-mod/refs/heads/${branch}/build.gradle`,
+      },
+      {
+        label: "Fabric Example gradle.properties",
+        url: `https://raw.githubusercontent.com/FabricMC/fabric-example-mod/refs/heads/${branch}/gradle.properties`,
+      },
+      {
+        label: "Fabric Example fabric.mod.json",
+        url: `https://raw.githubusercontent.com/FabricMC/fabric-example-mod/refs/heads/${branch}/src/main/resources/fabric.mod.json`,
+      }
+    );
+  }
+
+  const merged = [...dynamicSources, ...staticSources];
+  const seen = new Set();
+  return merged.filter((source) => {
+    if (!source?.url || seen.has(source.url)) {
+      return false;
+    }
+    seen.add(source.url);
+    return true;
+  });
+}
+
+function buildLoaderVersionResearchGuidance({ targetType, minecraftVersion }) {
+  const version = String(minecraftVersion || "").trim() || "the requested version";
+
+  if (targetType === "fabric-mod") {
+    return [
+      `Target loader: Fabric.`,
+      `Target Minecraft version: ${version}.`,
+      "Use the researched official Fabric example files for this version as the source of truth for plugin IDs, loader/API versions, dependency coordinates, and mappings setup.",
+      "Derive the import namespace from the researched mappings setup.",
+      "If the researched build uses officialMojangMappings, use Mojang-named imports.",
+      "If the researched build uses Yarn mappings, use Yarn-named imports and intermediary-aware setup.",
+      "Never mix Mojang-named imports with a Yarn/intermediary mappings setup, and never mix Yarn imports with Mojang mappings.",
+    ].join("\n");
+  }
+
+  if (targetType === "forge-mod" || targetType === "neoforge-mod") {
+    return [
+      `Target loader: ${targetType === "forge-mod" ? "Forge" : "NeoForge"}.`,
+      `Target Minecraft version: ${version}.`,
+      "Use version-correct official docs context for dependency coordinates and APIs.",
+      "Keep imports and names consistent with the researched mappings/documentation for that loader and version.",
+      "Do not use Fabric/Yarn import names in Forge or NeoForge projects.",
+    ].join("\n");
+  }
+
+  if (
+    targetType === "paper-plugin" ||
+    targetType === "spigot-plugin" ||
+    targetType === "bukkit-plugin" ||
+    targetType === "velocity-plugin"
+  ) {
+    return [
+      `Target platform: ${targetType}.`,
+      `Target Minecraft version: ${version}.`,
+      "Use the researched API docs for the selected platform and version to choose imports, event classes, and registration patterns.",
+      "Do not mix APIs across Paper, Spigot, Bukkit, or Velocity.",
+    ].join("\n");
+  }
+
+  return `Target platform: ${targetType}. Target Minecraft version: ${version}. Use researched documentation as the source of truth for imports, APIs, and dependency coordinates.`;
+}
+
+function extractResearchTerms(messages, buildLog, targetType, minecraftVersion) {
+  const terms = [
+    ...extractBuildTerms(buildLog),
+    ...String(
+      Array.isArray(messages) ? messages.map((message) => message?.content || "").join("\n") : ""
+    ).match(/[A-Za-z_][A-Za-z0-9_.]{2,}/g) || [],
+    ...String(targetType || "").split(/[-_\s]+/g),
+    ...String(minecraftVersion || "").split(/[^0-9]+/g).filter(Boolean),
+    "mappings",
+    "imports",
+    "officialMojangMappings",
+    "yarn",
+    "intermediary",
+  ];
+
+  return [...new Set(terms)]
+    .filter((term) => !/^(java|gradle|error|failed|task|build|minecraft|fabric|forge|mod|plugin)$/i.test(term))
+    .slice(0, 16);
+}
+
+async function fetchResearchSource(source, researchTerms) {
   try {
     const response = await fetch(source.url, {
       headers: {
@@ -2065,7 +2557,7 @@ async function fetchResearchSource(source, buildLog) {
     }
 
     const html = await response.text();
-    const text = extractMeaningfulDocText(html, buildLog);
+    const text = extractMeaningfulDocText(html, researchTerms);
     if (!text) {
       return "";
     }
@@ -2076,17 +2568,16 @@ async function fetchResearchSource(source, buildLog) {
   }
 }
 
-function extractMeaningfulDocText(html, buildLog) {
+function extractMeaningfulDocText(html, researchTerms) {
   const text = stripHtml(html);
   if (!text) {
     return "";
   }
 
   const trimmed = text.slice(0, 20000);
-  const buildTerms = extractBuildTerms(buildLog);
 
-  if (buildTerms.length > 0) {
-    for (const term of buildTerms) {
+  if (Array.isArray(researchTerms) && researchTerms.length > 0) {
+    for (const term of researchTerms) {
       const index = trimmed.toLowerCase().indexOf(term.toLowerCase());
       if (index !== -1) {
         const start = Math.max(0, index - 600);
@@ -2162,7 +2653,20 @@ function applyProjectRepair(project, repair) {
   return changed;
 }
 
+function createProjectStateSignature(project) {
+  return JSON.stringify(
+    [...project.files]
+      .map((file) => ({
+        path: file.path,
+        content: String(file.content).replace(/\r\n/g, "\n"),
+      }))
+      .sort((left, right) => left.path.localeCompare(right.path))
+  );
+}
+
 async function writeProjectFiles(project, projectDir) {
+  await fs.promises.rm(projectDir, { recursive: true, force: true });
+
   for (const file of project.files) {
     const targetPath = path.join(projectDir, file.path);
     if (!targetPath.startsWith(projectDir)) {
