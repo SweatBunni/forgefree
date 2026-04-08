@@ -47,6 +47,10 @@ const MAX_RESEARCH_SOURCES = 3;
 const MAX_RESEARCH_CHARS_PER_SOURCE = 2200;
 const DEFAULT_MAX_COMPLETION_TOKENS = Number(process.env.MISTRAL_MAX_TOKENS || "12000");
 const MAX_CONTINUATION_PASSES = Number(process.env.MISTRAL_MAX_CONTINUATIONS || "3");
+const MISTRAL_RATE_LIMIT_RETRIES = Number(process.env.MISTRAL_RATE_LIMIT_RETRIES || "2");
+const MISTRAL_RATE_LIMIT_BASE_DELAY_MS = Number(
+  process.env.MISTRAL_RATE_LIMIT_BASE_DELAY_MS || "1500"
+);
 const RESEARCH_SOURCE_MAP = {
   "fabric-mod": [
     {
@@ -288,6 +292,19 @@ async function processApiRequest({ method, pathname, bodyText }) {
       ? null
       : createJsonResponse(405, { error: "Method not allowed." });
   } catch (error) {
+    if (error instanceof HttpError) {
+      return createJsonResponse(
+        error.status,
+        {
+          error: error.message || "Request failed.",
+          details: error.details || error.message || "",
+          retryAfterSeconds:
+            typeof error.retryAfterSeconds === "number" ? error.retryAfterSeconds : undefined,
+        },
+        error.headers || {}
+      );
+    }
+
     const message = error instanceof Error ? error.message : String(error);
     return createJsonResponse(500, {
       error: message || "Request failed.",
@@ -722,17 +739,60 @@ async function requestMistralOnce({ messages, temperature, maxTokens }) {
     }),
   });
 
-  const data = await response.json();
+  const rawText = await response.text();
+  const data = parseProviderJson(rawText);
   if (!response.ok) {
-    const message = data?.message || data?.error || "Codestral request failed.";
-    throw new Error(message);
+    const providerMessage =
+      data?.message ||
+      data?.error ||
+      data?.detail ||
+      rawText ||
+      `Codestral request failed with HTTP ${response.status}.`;
+    const retryAfterSeconds = parseRetryAfterSeconds(response.headers.get("retry-after"));
+
+    if (response.status === 429 || /rate limit/i.test(providerMessage)) {
+      throw new HttpError(buildRateLimitMessage(retryAfterSeconds), {
+        status: 429,
+        details: providerMessage,
+        retryAfterSeconds,
+        headers:
+          typeof retryAfterSeconds === "number"
+            ? { "Retry-After": String(retryAfterSeconds) }
+            : {},
+      });
+    }
+
+    throw new HttpError(providerMessage, {
+      status: response.status || 502,
+      details: providerMessage,
+    });
   }
 
   return data;
 }
 
+async function requestMistralWithRetry({ messages, temperature, maxTokens }) {
+  let lastError = null;
+
+  for (let attempt = 0; attempt <= MISTRAL_RATE_LIMIT_RETRIES; attempt += 1) {
+    try {
+      return await requestMistralOnce({ messages, temperature, maxTokens });
+    } catch (error) {
+      lastError = error;
+      if (!(error instanceof HttpError) || error.status !== 429 || attempt >= MISTRAL_RATE_LIMIT_RETRIES) {
+        throw error;
+      }
+
+      const retryAfterMs = getRetryDelayMs(error.retryAfterSeconds, attempt);
+      await sleep(retryAfterMs);
+    }
+  }
+
+  throw lastError || new Error("Codestral request failed.");
+}
+
 async function requestMistral({ messages, temperature, maxTokens }) {
-  const firstData = await requestMistralOnce({ messages, temperature, maxTokens });
+  const firstData = await requestMistralWithRetry({ messages, temperature, maxTokens });
   let combinedContent = extractAssistantContent(firstData);
   let lastData = firstData;
   let continuationCount = 0;
@@ -742,7 +802,7 @@ async function requestMistral({ messages, temperature, maxTokens }) {
     shouldContinueMistralResponse(lastData, combinedContent) &&
     continuationCount < MAX_CONTINUATION_PASSES
   ) {
-    const continuationData = await requestMistralOnce({
+    const continuationData = await requestMistralWithRetry({
       messages: [
         ...messages,
         { role: "assistant", content: combinedContent },
@@ -777,6 +837,70 @@ async function requestMistral({ messages, temperature, maxTokens }) {
   }
 
   return lastData;
+}
+
+class HttpError extends Error {
+  constructor(message, options = {}) {
+    super(message);
+    this.name = "HttpError";
+    this.status = Number(options.status) || 500;
+    this.details = options.details || "";
+    this.retryAfterSeconds =
+      typeof options.retryAfterSeconds === "number" ? options.retryAfterSeconds : undefined;
+    this.headers = options.headers || {};
+  }
+}
+
+function parseProviderJson(rawText) {
+  if (!rawText || !rawText.trim()) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(rawText);
+  } catch (_error) {
+    return {};
+  }
+}
+
+function parseRetryAfterSeconds(headerValue) {
+  if (!headerValue) {
+    return undefined;
+  }
+
+  const numeric = Number(headerValue);
+  if (Number.isFinite(numeric) && numeric >= 0) {
+    return Math.ceil(numeric);
+  }
+
+  const timestamp = Date.parse(headerValue);
+  if (!Number.isFinite(timestamp)) {
+    return undefined;
+  }
+
+  const seconds = Math.ceil((timestamp - Date.now()) / 1000);
+  return seconds > 0 ? seconds : undefined;
+}
+
+function getRetryDelayMs(retryAfterSeconds, attempt) {
+  if (typeof retryAfterSeconds === "number" && retryAfterSeconds > 0) {
+    return retryAfterSeconds * 1000;
+  }
+
+  const baseDelay = Math.max(250, MISTRAL_RATE_LIMIT_BASE_DELAY_MS);
+  return baseDelay * Math.pow(2, attempt);
+}
+
+function buildRateLimitMessage(retryAfterSeconds) {
+  if (typeof retryAfterSeconds === "number" && retryAfterSeconds > 0) {
+    return `Codestral is temporarily rate limited. ForgefreeAI retried automatically, but the provider is still throttling requests. Please wait about ${retryAfterSeconds} seconds and try again.`;
+  }
+
+  return "Codestral is temporarily rate limited. ForgefreeAI retried automatically, but the provider is still throttling requests. Please wait a moment and try again.";
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function normalizeMessages(messages) {
