@@ -47,10 +47,19 @@ const MAX_RESEARCH_SOURCES = 3;
 const MAX_RESEARCH_CHARS_PER_SOURCE = 2200;
 const DEFAULT_MAX_COMPLETION_TOKENS = Number(process.env.MISTRAL_MAX_TOKENS || "12000");
 const MAX_CONTINUATION_PASSES = Number(process.env.MISTRAL_MAX_CONTINUATIONS || "3");
+const MISTRAL_REQUEST_COOLDOWN_MS = Number(process.env.MISTRAL_REQUEST_COOLDOWN_MS || "2500");
 const MISTRAL_RATE_LIMIT_RETRIES = Number(process.env.MISTRAL_RATE_LIMIT_RETRIES || "2");
 const MISTRAL_RATE_LIMIT_BASE_DELAY_MS = Number(
   process.env.MISTRAL_RATE_LIMIT_BASE_DELAY_MS || "1500"
 );
+const BUILD_PROVIDER_RATE_LIMIT_RETRIES = Number(
+  process.env.BUILD_PROVIDER_RATE_LIMIT_RETRIES || "6"
+);
+const BUILD_PROVIDER_RATE_LIMIT_MAX_DELAY_MS = Number(
+  process.env.BUILD_PROVIDER_RATE_LIMIT_MAX_DELAY_MS || "120000"
+);
+let mistralRequestQueue = Promise.resolve();
+let nextMistralRequestAt = 0;
 const RESEARCH_SOURCE_MAP = {
   "fabric-mod": [
     {
@@ -484,33 +493,66 @@ function queueBuildJob(jobId, messages, temperature, preferences) {
       details: "",
     });
 
-    try {
-      const session = await buildProjectSession(
-        messages,
-        temperature,
-        preferences,
-        async (progress) => {
-          await updateBuildJobRecord(jobId, progress);
+    for (let providerRetry = 0; providerRetry <= BUILD_PROVIDER_RATE_LIMIT_RETRIES; providerRetry += 1) {
+      try {
+        const session = await buildProjectSession(
+          messages,
+          temperature,
+          preferences,
+          async (progress) => {
+            await updateBuildJobRecord(jobId, progress);
+          }
+        );
+        await updateBuildJobRecord(jobId, {
+          status: "succeeded",
+          stage: "complete",
+          message: "Build finished successfully.",
+          session,
+          attempts: session?.attempts || 1,
+          error: "",
+          details: "",
+        });
+        return;
+      } catch (error) {
+        if (
+          error instanceof HttpError &&
+          error.status === 429 &&
+          providerRetry < BUILD_PROVIDER_RATE_LIMIT_RETRIES
+        ) {
+          const retryDelayMs = Math.min(
+            BUILD_PROVIDER_RATE_LIMIT_MAX_DELAY_MS,
+            getRetryDelayMs(error.retryAfterSeconds, providerRetry)
+          );
+
+          await updateBuildJobRecord(jobId, {
+            status: "running",
+            stage: "waiting-provider",
+            message: buildBackgroundRateLimitMessage(retryDelayMs, providerRetry + 1),
+            error: "",
+            details: error.details || error.message || "",
+          });
+
+          await sleep(retryDelayMs);
+
+          await updateBuildJobRecord(jobId, {
+            status: "running",
+            stage: "starting",
+            message: "Codestral capacity is available again. Resuming the background build...",
+            error: "",
+          });
+          continue;
         }
-      );
-      await updateBuildJobRecord(jobId, {
-        status: "succeeded",
-        stage: "complete",
-        message: "Build finished successfully.",
-        session,
-        attempts: session?.attempts || 1,
-        error: "",
-        details: "",
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      await updateBuildJobRecord(jobId, {
-        status: "failed",
-        stage: "failed",
-        message: "Build failed.",
-        error: message || "Build failed.",
-        details: message || "",
-      });
+
+        const message = error instanceof Error ? error.message : String(error);
+        await updateBuildJobRecord(jobId, {
+          status: "failed",
+          stage: "failed",
+          message: "Build failed.",
+          error: message || "Build failed.",
+          details: message || "",
+        });
+        return;
+      }
     }
   };
 
@@ -719,56 +761,58 @@ function parseJsonBody(bodyText) {
 }
 
 async function requestMistralOnce({ messages, temperature, maxTokens }) {
-  const response = await fetch("https://api.mistral.ai/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${MISTRAL_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: DEFAULT_MODEL,
-      temperature:
-        typeof temperature === "number" && temperature >= 0 && temperature <= 1.5
-          ? temperature
-          : 0.2,
-      max_tokens:
-        typeof maxTokens === "number" && Number.isFinite(maxTokens) && maxTokens > 0
-          ? Math.floor(maxTokens)
-          : DEFAULT_MAX_COMPLETION_TOKENS,
-      messages,
-    }),
-  });
+  return enqueueMistralRequest(async () => {
+    const response = await fetch("https://api.mistral.ai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${MISTRAL_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: DEFAULT_MODEL,
+        temperature:
+          typeof temperature === "number" && temperature >= 0 && temperature <= 1.5
+            ? temperature
+            : 0.2,
+        max_tokens:
+          typeof maxTokens === "number" && Number.isFinite(maxTokens) && maxTokens > 0
+            ? Math.floor(maxTokens)
+            : DEFAULT_MAX_COMPLETION_TOKENS,
+        messages,
+      }),
+    });
 
-  const rawText = await response.text();
-  const data = parseProviderJson(rawText);
-  if (!response.ok) {
-    const providerMessage =
-      data?.message ||
-      data?.error ||
-      data?.detail ||
-      rawText ||
-      `Codestral request failed with HTTP ${response.status}.`;
-    const retryAfterSeconds = parseRetryAfterSeconds(response.headers.get("retry-after"));
+    const rawText = await response.text();
+    const data = parseProviderJson(rawText);
+    if (!response.ok) {
+      const providerMessage =
+        data?.message ||
+        data?.error ||
+        data?.detail ||
+        rawText ||
+        `Codestral request failed with HTTP ${response.status}.`;
+      const retryAfterSeconds = parseRetryAfterSeconds(response.headers.get("retry-after"));
 
-    if (response.status === 429 || /rate limit/i.test(providerMessage)) {
-      throw new HttpError(buildRateLimitMessage(retryAfterSeconds), {
-        status: 429,
+      if (response.status === 429 || /rate limit/i.test(providerMessage)) {
+        throw new HttpError(buildRateLimitMessage(retryAfterSeconds), {
+          status: 429,
+          details: providerMessage,
+          retryAfterSeconds,
+          headers:
+            typeof retryAfterSeconds === "number"
+              ? { "Retry-After": String(retryAfterSeconds) }
+              : {},
+        });
+      }
+
+      throw new HttpError(providerMessage, {
+        status: response.status || 502,
         details: providerMessage,
-        retryAfterSeconds,
-        headers:
-          typeof retryAfterSeconds === "number"
-            ? { "Retry-After": String(retryAfterSeconds) }
-            : {},
       });
     }
 
-    throw new HttpError(providerMessage, {
-      status: response.status || 502,
-      details: providerMessage,
-    });
-  }
-
-  return data;
+    return data;
+  });
 }
 
 async function requestMistralWithRetry({ messages, temperature, maxTokens }) {
@@ -863,6 +907,26 @@ function parseProviderJson(rawText) {
   }
 }
 
+function enqueueMistralRequest(task) {
+  const runner = async () => {
+    const cooldownMs = Math.max(0, MISTRAL_REQUEST_COOLDOWN_MS);
+    const waitMs = Math.max(0, nextMistralRequestAt - Date.now());
+    if (waitMs > 0) {
+      await sleep(waitMs);
+    }
+
+    try {
+      return await task();
+    } finally {
+      nextMistralRequestAt = Date.now() + cooldownMs;
+    }
+  };
+
+  const queued = mistralRequestQueue.then(runner, runner);
+  mistralRequestQueue = queued.catch(() => {});
+  return queued;
+}
+
 function parseRetryAfterSeconds(headerValue) {
   if (!headerValue) {
     return undefined;
@@ -897,6 +961,11 @@ function buildRateLimitMessage(retryAfterSeconds) {
   }
 
   return "Codestral is temporarily rate limited. ForgefreeAI retried automatically, but the provider is still throttling requests. Please wait a moment and try again.";
+}
+
+function buildBackgroundRateLimitMessage(retryDelayMs, attempt) {
+  const seconds = Math.max(1, Math.ceil(retryDelayMs / 1000));
+  return `Codestral is busy right now. ForgefreeAI is keeping your build alive and will retry automatically in about ${seconds} seconds (background retry ${attempt}).`;
 }
 
 function sleep(ms) {

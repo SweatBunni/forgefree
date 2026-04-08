@@ -794,6 +794,7 @@ function formatBuildStage(stage, attempts) {
   const base = {
     queued: "Queued",
     starting: "Starting",
+    "waiting-provider": "Waiting on Provider",
     generating: "Generating",
     preparing: "Preparing",
     building: "Building",
