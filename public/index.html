@@ -4,104 +4,79 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>ForgefreeAI</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap"
-      rel="stylesheet"
-    />
-    <link rel="stylesheet" href="./styles.css" />
+    <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
     <div class="app-shell">
       <aside class="sidebar">
         <div class="brand-card">
-          <div class="brand-glow"></div>
-          <p class="eyebrow">Minecraft Java Coding Only</p>
-          <h1>ForgefreeAI</h1>
-          <p class="brand-copy">
-            A clean chat workspace for Fabric, Forge, Paper, Spigot, datapacks,
-            mixins, commands, debugging, and buildable Java project generation.
-          </p>
+          <div class="brand-mark">F</div>
+          <div>
+            <p class="eyebrow">Minecraft Java Studio</p>
+            <h1>ForgefreeAI</h1>
+            <p class="brand-copy">Codestral-powered chat, builds, and downloads for Minecraft Java projects.</p>
+          </div>
         </div>
 
-        <section class="panel">
-          <div class="panel-header">
-            <h2>Past chats</h2>
-            <span id="chatCount" class="panel-count">0</span>
+        <button id="new-chat-button" class="ghost-button wide-button" type="button">
+          New Chat
+        </button>
+
+        <div class="sidebar-section">
+          <div class="section-row">
+            <h2>Past Chats</h2>
+            <span id="chat-count" class="muted-pill">0</span>
           </div>
-          <div id="chatList" class="chat-list"></div>
-        </section>
+          <div id="chat-list" class="chat-list"></div>
+        </div>
       </aside>
 
-      <main class="main-panel">
+      <main class="workspace">
         <header class="topbar">
           <div>
-            <p class="eyebrow">Model</p>
-            <h2>Codestral via Mistral AI</h2>
+            <p class="eyebrow">Render-safe Build Flow</p>
+            <h2 id="chat-title">New Minecraft Project</h2>
           </div>
-          <div class="status-cluster">
-            <div id="apiStatus" class="status-pill">Checking API</div>
-            <label class="temperature-control">
-              <span>Temperature</span>
-              <input id="temperatureInput" type="range" min="0" max="1.2" step="0.1" value="0.2" />
-              <strong id="temperatureValue">0.2</strong>
-            </label>
+
+          <div class="topbar-actions">
+            <button id="download-source-button" class="action-button" type="button">
+              Download Source
+            </button>
+            <button id="build-jar-button" class="action-button primary-button" type="button">
+              Download JAR
+            </button>
           </div>
         </header>
 
-        <section class="toolbar">
-          <div class="toolbar-actions">
-            <button id="buildJarButton" class="ghost-button" type="button">Download JAR</button>
-            <button id="downloadSourceButton" class="ghost-button" type="button">Download Source</button>
-            <button id="newChatButton" class="primary-button" type="button">New Chat</button>
+        <section class="workspace-meta">
+          <div class="meta-card">
+            <span class="meta-label">Host</span>
+            <strong id="host-label">Checking...</strong>
           </div>
-          <p id="actionStatus" class="toolbar-note">
-            Download the built JAR or the source ZIP directly from the website.
-          </p>
-        </section>
-
-        <section id="welcomeState" class="welcome-state">
-          <div class="welcome-card">
-            <p class="eyebrow">Focused workspace</p>
-            <h3>Build Minecraft Java code faster</h3>
-            <p>
-              Ask for a full mod, plugin, datapack, or crash fix. When the chat looks
-              right, download a built JAR or a fresh source ZIP straight from the current
-              conversation.
-            </p>
-            <div class="suggestion-grid">
-              <button class="suggestion-chip" data-prompt="Create a Fabric 1.21.1 mod that adds a custom ore, item, and crafting recipe.">
-                Custom Fabric mod
-              </button>
-              <button class="suggestion-chip" data-prompt="Write a Paper plugin with a /heal command, permissions, config reload support, and tab completion.">
-                Paper plugin
-              </button>
-              <button class="suggestion-chip" data-prompt="Build a NeoForge mod with a custom block, item group, and data generation setup.">
-                NeoForge starter
-              </button>
-              <button class="suggestion-chip" data-prompt="Debug this Minecraft crash and explain the root cause before proposing the fix.">
-                Crash debugging
-              </button>
-            </div>
+          <div class="meta-card">
+            <span class="meta-label">Model</span>
+            <strong id="model-label">Codestral</strong>
+          </div>
+          <div class="meta-card status-card">
+            <span class="meta-label">Status</span>
+            <strong id="status-text">Ready.</strong>
           </div>
         </section>
 
-        <section id="messageThread" class="message-thread"></section>
+        <section id="messages" class="messages"></section>
 
-        <form id="composer" class="composer">
-          <label class="field prompt-field">
-            <span>Prompt</span>
-            <textarea
-              id="promptInput"
-              rows="5"
-              placeholder="Ask for Minecraft Java code, then press Enter to send. Use Shift+Enter for a new line."
-            ></textarea>
-          </label>
-          <div class="prompt-options">
-            <label class="field compact-field">
-              <span>Loader</span>
-              <select id="loaderSelect">
+        <form id="composer-form" class="composer">
+          <label class="composer-label" for="prompt-input">Describe the Minecraft Java project you want.</label>
+          <textarea
+            id="prompt-input"
+            rows="5"
+            placeholder="Example: Build a Fabric 1.21.1 mod that adds glowing crystal caves, custom ores, loot tables, textures, and a fully working Gradle project."
+          ></textarea>
+
+          <div class="composer-controls">
+            <div class="control-group">
+              <label for="loader-select">Loader</label>
+              <select id="loader-select">
                 <option value="auto">Auto detect</option>
                 <option value="fabric">Fabric</option>
                 <option value="forge">Forge</option>
@@ -113,48 +88,31 @@
                 <option value="datapack">Datapack</option>
                 <option value="resource-pack">Resource Pack</option>
               </select>
-            </label>
-            <label class="field compact-field">
-              <span>Minecraft Version</span>
-              <input
-                id="versionInput"
-                type="text"
-                list="minecraftVersions"
-                value="1.21.1"
-                placeholder="1.21.1"
-              />
-              <datalist id="minecraftVersions">
-                <option value="1.21.11"></option>
-                <option value="1.21.8"></option>
-                <option value="1.21.4"></option>
+            </div>
+
+            <div class="control-group">
+              <label for="version-input">Minecraft Version</label>
+              <input id="version-input" type="text" list="minecraft-versions" placeholder="1.21.1" />
+              <datalist id="minecraft-versions">
                 <option value="1.21.1"></option>
+                <option value="1.21.4"></option>
+                <option value="1.21.5"></option>
                 <option value="1.20.6"></option>
-                <option value="1.20.4"></option>
-                <option value="1.20.1"></option>
-                <option value="1.19.4"></option>
               </datalist>
-            </label>
-          </div>
-          <div class="composer-actions">
-            <p class="composer-note">
-              This assistant stays scoped to Minecraft Java development and can turn the current chat into source files or a built JAR.
-            </p>
-            <button id="sendButton" type="submit" class="primary-button">Send</button>
+            </div>
+
+            <div class="control-group grow">
+              <span class="helper-text">Press Enter to send. Use Shift+Enter for a new line.</span>
+            </div>
+
+            <button id="send-button" class="primary-button send-button" type="submit">
+              Send
+            </button>
           </div>
         </form>
       </main>
     </div>
 
-    <template id="messageTemplate">
-      <article class="message">
-        <div class="message-meta">
-          <span class="role-badge"></span>
-          <button class="copy-button" type="button">Copy</button>
-        </div>
-        <div class="message-body"></div>
-      </article>
-    </template>
-
-    <script src="./app.js"></script>
+    <script src="/app.js" defer></script>
   </body>
 </html>

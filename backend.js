@@ -38,8 +38,11 @@ let gradleCacheDir;
 let gradleUserHome;
 let gradleTempDir;
 let buildSessionsDir;
+let buildJobsDir;
+const activeBuildJobs = new Map();
 const MAX_BUILD_REPAIR_ATTEMPTS = Number(process.env.MAX_BUILD_REPAIR_ATTEMPTS || "0");
 const MAX_STALLED_BUILD_ATTEMPTS = Number(process.env.MAX_STALLED_BUILD_ATTEMPTS || "6");
+const BUILD_JOB_POLL_MAX_AGE_MS = Number(process.env.BUILD_JOB_POLL_MAX_AGE_MS || 6 * 60 * 60 * 1000);
 const MAX_RESEARCH_SOURCES = 3;
 const MAX_RESEARCH_CHARS_PER_SOURCE = 2200;
 const DEFAULT_MAX_COMPLETION_TOKENS = Number(process.env.MISTRAL_MAX_TOKENS || "12000");
@@ -220,12 +223,14 @@ gradleCacheDir = path.join(runtimeDir, "gradle");
 gradleUserHome = path.join(runtimeDir, "gradle-user-home");
 gradleTempDir = path.join(runtimeDir, "tmp");
 buildSessionsDir = path.join(runtimeDir, "build-sessions");
+buildJobsDir = path.join(runtimeDir, "build-jobs");
 
 fs.mkdirSync(generatedDir, { recursive: true });
 fs.mkdirSync(gradleCacheDir, { recursive: true });
 fs.mkdirSync(gradleUserHome, { recursive: true });
 fs.mkdirSync(gradleTempDir, { recursive: true });
 fs.mkdirSync(buildSessionsDir, { recursive: true });
+fs.mkdirSync(buildJobsDir, { recursive: true });
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -250,6 +255,7 @@ async function processApiRequest({ method, pathname, bodyText }) {
         hostingTarget: HOSTING_TARGET,
         sourceExportSupported: true,
         jarBuildSupported: true,
+        buildJobsSupported: !IS_SERVERLESS,
         sessionBuildSupported: !IS_SERVERLESS,
       });
     }
@@ -260,6 +266,10 @@ async function processApiRequest({ method, pathname, bodyText }) {
 
     if (method === "POST" && pathname === "/api/build/run") {
       return await handleBuildRun(bodyText);
+    }
+
+    if (method === "GET" && pathname.startsWith("/api/build/status/")) {
+      return await handleBuildStatus(pathname);
     }
 
     if (method === "GET" && pathname.startsWith("/api/artifacts/")) {
@@ -389,8 +399,200 @@ async function handleBuildRun(bodyText) {
     return createJsonResponse(400, { error: "Messages are required to build a project." });
   }
 
-  const session = await buildProjectSession(cleanMessages, payload.temperature, preferences);
-  return createJsonResponse(200, session);
+  await pruneExpiredBuildJobs();
+  const job = await createBuildJobRecord({
+    messages: cleanMessages,
+    temperature: payload.temperature,
+    preferences,
+  });
+
+  queueBuildJob(job.jobId, cleanMessages, payload.temperature, preferences);
+
+  return createJsonResponse(202, {
+    ok: true,
+    jobId: job.jobId,
+    status: job.status,
+    stage: job.stage,
+    message: job.message,
+  });
+}
+
+async function handleBuildStatus(requestPath) {
+  const parts = requestPath.split("/").filter(Boolean);
+  const jobId = parts[3] || "";
+  if (!/^[a-z0-9-]+$/i.test(jobId)) {
+    return createJsonResponse(400, { error: "Invalid build status request." });
+  }
+
+  const job = await loadBuildJobRecord(jobId);
+  if (!job) {
+    return createJsonResponse(404, { error: "Build job not found." });
+  }
+
+  return createJsonResponse(200, sanitizeBuildJobForClient(job));
+}
+
+async function createBuildJobRecord({ messages, temperature, preferences }) {
+  const jobId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const job = {
+    jobId,
+    status: "queued",
+    stage: "queued",
+    message: "Queued the build job.",
+    attempts: 0,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    requestedLoader: preferences?.loader || "auto",
+    requestedMinecraftVersion: preferences?.minecraftVersion || "1.21.1",
+    messages,
+    temperature: typeof temperature === "number" ? temperature : 0.2,
+    preferences,
+    session: null,
+    error: "",
+    details: "",
+  };
+
+  await persistBuildJobRecord(job);
+  return job;
+}
+
+function queueBuildJob(jobId, messages, temperature, preferences) {
+  const runner = async () => {
+    await updateBuildJobRecord(jobId, {
+      status: "running",
+      stage: "starting",
+      message: "Starting the background build on the server...",
+      attempts: 0,
+      error: "",
+      details: "",
+    });
+
+    try {
+      const session = await buildProjectSession(
+        messages,
+        temperature,
+        preferences,
+        async (progress) => {
+          await updateBuildJobRecord(jobId, progress);
+        }
+      );
+      await updateBuildJobRecord(jobId, {
+        status: "succeeded",
+        stage: "complete",
+        message: "Build finished successfully.",
+        session,
+        attempts: session?.attempts || 1,
+        error: "",
+        details: "",
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await updateBuildJobRecord(jobId, {
+        status: "failed",
+        stage: "failed",
+        message: "Build failed.",
+        error: message || "Build failed.",
+        details: message || "",
+      });
+    }
+  };
+
+  runner().catch(async (error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    await updateBuildJobRecord(jobId, {
+      status: "failed",
+      stage: "failed",
+      message: "Build failed.",
+      error: message || "Build failed.",
+      details: message || "",
+    }).catch(() => {});
+  });
+}
+
+async function updateBuildJobRecord(jobId, updates) {
+  const existing = await loadBuildJobRecord(jobId);
+  if (!existing) {
+    return null;
+  }
+
+  const nextJob = {
+    ...existing,
+    ...updates,
+    jobId,
+    updatedAt: new Date().toISOString(),
+  };
+
+  if (typeof updates.attempt === "number") {
+    nextJob.attempts = Math.max(nextJob.attempts || 0, updates.attempt);
+  }
+
+  await persistBuildJobRecord(nextJob);
+  return nextJob;
+}
+
+async function loadBuildJobRecord(jobId) {
+  const inMemory = activeBuildJobs.get(jobId);
+  if (inMemory) {
+    return inMemory;
+  }
+
+  const filePath = path.join(buildJobsDir, `${jobId}.json`);
+  if (!fs.existsSync(filePath)) {
+    return null;
+  }
+
+  const raw = await fs.promises.readFile(filePath, "utf8");
+  const job = JSON.parse(raw);
+  activeBuildJobs.set(jobId, job);
+  return job;
+}
+
+async function persistBuildJobRecord(job) {
+  activeBuildJobs.set(job.jobId, job);
+  const persisted = {
+    ...job,
+    messages: undefined,
+    temperature: undefined,
+    preferences: undefined,
+  };
+  await fs.promises.writeFile(
+    path.join(buildJobsDir, `${job.jobId}.json`),
+    JSON.stringify(persisted, null, 2),
+    "utf8"
+  );
+}
+
+function sanitizeBuildJobForClient(job) {
+  return {
+    jobId: job.jobId,
+    status: job.status,
+    stage: job.stage,
+    message: job.message,
+    attempts: job.attempts || 0,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    error: job.error || "",
+    details: job.details || "",
+    session: job.session || null,
+  };
+}
+
+async function pruneExpiredBuildJobs() {
+  const dirEntries = await fs.promises.readdir(buildJobsDir, { withFileTypes: true });
+  const cutoff = Date.now() - BUILD_JOB_POLL_MAX_AGE_MS;
+
+  for (const entry of dirEntries) {
+    if (!entry.isFile() || !entry.name.endsWith(".json")) {
+      continue;
+    }
+
+    const fullPath = path.join(buildJobsDir, entry.name);
+    const stats = await fs.promises.stat(fullPath);
+    if (stats.mtimeMs < cutoff) {
+      activeBuildJobs.delete(entry.name.replace(/\.json$/i, ""));
+      await fs.promises.unlink(fullPath).catch(() => {});
+    }
+  }
 }
 
 async function handleArtifactDownload(requestPath) {
@@ -1293,7 +1495,11 @@ function guessJavaPackageGroup(project) {
   return lastDot > 0 ? packageName.slice(0, lastDot) : packageName;
 }
 
-async function buildProjectSession(messages, temperature, preferences) {
+async function buildProjectSession(messages, temperature, preferences, onProgress) {
+  await notifyBuildProgress(onProgress, {
+    stage: "generating",
+    message: "Generating the Minecraft project files...",
+  });
   const project = await generateProjectBundle(messages, temperature, preferences);
   if (project.buildTool !== "gradle") {
     throw new Error(
@@ -1303,6 +1509,10 @@ async function buildProjectSession(messages, temperature, preferences) {
   }
 
   const workspace = await materializeProject(project);
+  await notifyBuildProgress(onProgress, {
+    stage: "preparing",
+    message: "Preparing the project workspace and Gradle runtime...",
+  });
   const gradleBat = await ensureGradleDistribution();
   const attemptLogs = [];
   const repairSummaries = [];
@@ -1312,6 +1522,11 @@ async function buildProjectSession(messages, temperature, preferences) {
 
   while (MAX_BUILD_REPAIR_ATTEMPTS <= 0 || attempt <= MAX_BUILD_REPAIR_ATTEMPTS) {
     await writeProjectFiles(project, workspace.projectDir);
+    await notifyBuildProgress(onProgress, {
+      stage: "building",
+      attempt,
+      message: `Running Gradle build attempt ${attempt}...`,
+    });
 
     try {
       const buildResult = await runGradleBuild(gradleBat, workspace.projectDir);
@@ -1333,6 +1548,11 @@ async function buildProjectSession(messages, temperature, preferences) {
         buildResult,
       });
 
+      await notifyBuildProgress(onProgress, {
+        stage: "packaging",
+        attempt,
+        message: "Build finished. Packaging the JAR and source ZIP...",
+      });
       return manifest;
     } catch (error) {
       const buildLog = extractBuildErrorLog(error);
@@ -1358,6 +1578,11 @@ async function buildProjectSession(messages, temperature, preferences) {
         );
       }
 
+      await notifyBuildProgress(onProgress, {
+        stage: "repairing",
+        attempt,
+        message: `Build attempt ${attempt} failed. Researching the error and applying fixes...`,
+      });
       const repair = await repairProjectFromBuildError(project, buildLog, attempt);
       if (repair.summary) {
         repairSummaries.push(`Attempt ${attempt}: ${repair.summary}`);
@@ -1422,6 +1647,13 @@ async function saveBuildSessionManifest({
 
   await fs.promises.writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
   return manifest;
+}
+
+async function notifyBuildProgress(onProgress, progress) {
+  if (typeof onProgress !== "function") {
+    return;
+  }
+  await onProgress(progress);
 }
 
 function createBuildSummary(project, attemptLogs, repairSummaries) {

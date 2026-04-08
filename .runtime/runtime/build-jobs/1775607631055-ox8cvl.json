@@ -1,0 +1,14 @@
+{
+  "jobId": "1775607631055-ox8cvl",
+  "status": "failed",
+  "stage": "failed",
+  "message": "Build failed.",
+  "attempts": 0,
+  "createdAt": "2026-04-08T00:20:31.055Z",
+  "updatedAt": "2026-04-08T00:20:31.146Z",
+  "requestedLoader": "fabric",
+  "requestedMinecraftVersion": "1.21.1",
+  "session": null,
+  "error": "fetch failed",
+  "details": "fetch failed"
+}
